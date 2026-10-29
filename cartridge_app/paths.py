@@ -1,0 +1,16 @@
+"""User-writable storage independent of the executable location."""
+import os
+import sys
+from pathlib import Path
+
+
+def data_directory():
+    if sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
+    elif sys.platform == 'darwin':
+        base = Path.home() / 'Library' / 'Application Support'
+    else:
+        base = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share'))
+    result = base / 'CartridgeAccounting'
+    result.mkdir(parents=True, exist_ok=True)
+    return result
