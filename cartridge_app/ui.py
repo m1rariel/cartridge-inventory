@@ -1,6 +1,5 @@
 """Русский интерфейс автономного учёта картриджей."""
 import json
-import os
 import sqlite3
 import sys
 import webbrowser
@@ -14,10 +13,14 @@ from .localization import format_date, format_number, parse_date_input, status_l
 from .paths import data_directory
 from .preferences import PreferencesStore
 from .image_store import ImageStore
-from .settings_dialog import SettingsDialog
+from .settings_dialog import CatalogDialog, SettingsDialog
 from . import visual as visual_theme
 from .visual import COLORS, SPACING, apply_visual_settings, transition_label
 from .xlsx import export_inventory
+from .inventory_xlsx import import_inventory_xlsx
+from .voice import VoicePlayer
+from . import error_codes
+from .service import ValidationError
 
 
 class App:
@@ -31,6 +34,7 @@ class App:
         directory = data_directory()
         self.preferences = preferences or PreferencesStore(directory)
         self.settings = self.preferences.load()
+        self.voice = VoicePlayer(root, enabled=self.settings.sound_enabled)
         self.image_store = image_store or ImageStore(directory)
         self.language = self.settings.language
         self.current_screen = 'main'
@@ -59,6 +63,7 @@ class App:
         return tr(getattr(self, 'language', 'ru'), text, **values)
 
     def show_error(self, error, parent=None):
+        self._play_error_voice(error)
         self.show_dialog(self.t('Не удалось выполнить действие'),
                          translate_error(getattr(self, 'language', 'ru'), error),
                          kind='error', parent=parent)
@@ -118,7 +123,8 @@ class App:
         try:
             webbrowser.open(url)
         except Exception as error:
-            self.show_error(error)
+            # Browser launch errors are not inventory-file failures.
+            self.show_error(str(error))
 
     def save_preferences(self, **changes):
         old_language = self.language
@@ -129,6 +135,7 @@ class App:
             return False
         self.settings = saved
         self.language = saved.language
+        self.voice.set_enabled(saved.sound_enabled)
         if 'background_overlay' in changes:
             self._preview_overlay_value = saved.background_overlay
         apply_visual_settings(self.root, saved)
@@ -143,6 +150,7 @@ class App:
     def reset_preferences(self):
         self.settings = self.preferences.reset()
         self.language = self.settings.language
+        self.voice.set_enabled(self.settings.sound_enabled)
         self._preview_overlay_value = self.settings.background_overlay
         apply_visual_settings(self.root, self.settings)
         self.root.configure(background=COLORS['background'])
@@ -256,6 +264,7 @@ class App:
         self._error(error)
 
     def _error(self, error, parent=None):
+        self._play_error_voice(error)
         if isinstance(error, ValueError):
             text = translate_error(self.language, error)
         elif isinstance(error, (OSError, sqlite3.Error)):
@@ -263,6 +272,18 @@ class App:
         else:
             text = self.t('Не удалось выполнить действие. Данные не подтверждены; проверьте результат перед повтором.\n\n{error}', error=translate_error(self.language, error))
         self.show_dialog(self.t('Не удалось выполнить действие'), text, kind='error', parent=parent)
+
+    def _play_error_voice(self, error):
+        code = getattr(error, 'voice_code', None)
+        if code is None and isinstance(error, (OSError, sqlite3.Error)):
+            code = error_codes.DATA_READ_WRITE_FAILED
+        voice = getattr(self, 'voice', None)
+        if code and voice is not None:
+            try:
+                voice.play(code)
+            except Exception:
+                # Sound is optional; playback failures must not create new UI errors.
+                pass
 
     def _page(self, title, subtitle=''):
         title, subtitle = self.t(title), self.t(subtitle) if subtitle else ''
@@ -376,7 +397,9 @@ class App:
         ttk.Button(actions, text=self.t('Удалить картридж'), command=self.remove_dialog,
                    style='Danger.TButton').pack(side='left', padx=(8, 0))
         ttk.Button(actions, text=self.t('История'), command=self.show_history, style='Glass.TButton').pack(side='left', padx=8)
-        ttk.Button(actions, text=self.t('Экспорт списка в XLSX'), command=self.export, style='Glass.TButton').pack(side='right')
+        ttk.Button(actions, text=self.t('Экспорт XLSX'), command=self.export, style='Glass.TButton').pack(side='right')
+        ttk.Button(actions, text=self.t('Импорт XLSX'), command=self.import_inventory,
+                   style='Glass.TButton').pack(side='right', padx=(0, 8))
         self.query.trace_add('write', lambda *_: self.refresh())
         combo.bind('<<ComboboxSelected>>', lambda event: self.refresh())
         self.refresh()
@@ -417,7 +440,7 @@ class App:
     def _dialog(self, title):
         win = tk.Toplevel(self.root)
         win.title(self.t(title))
-        fit_dialog(win, self.root, size=(590, 390), minimum=(320, 300))
+        fit_dialog(win, self.root, size=(590, 550), minimum=(320, 390))
         win.grab_set()
         frame = ttk.Frame(win, style='Content.TFrame', padding=SPACING['xl'])
         frame.pack(fill='both', expand=True)
@@ -457,21 +480,68 @@ class App:
 
     def _edit_form(self, record):
         win, form = self._dialog('Редактирование экземпляра' if record else 'Новый экземпляр')
-        values = {}
-        for i, (field, label) in enumerate([('id', 'ID *'), ('name', 'Наименование *'), ('printers', 'Подходящие принтеры')]):
-            ttk.Label(form, text=self.t(label), style='Content.TLabel').grid(row=i, column=0, sticky='w', padx=(0, 14), pady=10)
-            values[field] = tk.StringVar(value=record.get(field, '') if record else '')
-            entry = ttk.Entry(form, textvariable=values[field])
-            entry.grid(row=i, column=1, sticky='ew', pady=10)
-            if record and field == 'id':
-                entry.configure(state='readonly')
-            elif field == ('name' if record else 'id'):
-                entry.focus_set()
+        values = {key: tk.StringVar(value=record.get(key, '') if record else '')
+                  for key in ('id', 'name', 'printers')}
+        ttk.Label(form, text=self.t('ID *'), style='Content.TLabel').grid(row=0, column=0, sticky='w', padx=(0, 14), pady=10)
+        id_entry = ttk.Entry(form, textvariable=values['id'])
+        id_entry.grid(row=0, column=1, sticky='ew', pady=10)
+        if record:
+            id_entry.configure(state='readonly')
+        else:
+            id_entry.focus_set()
+        ttk.Label(form, text=self.t('Наименование *'), style='Content.TLabel').grid(row=1, column=0, sticky='w', padx=(0, 14), pady=10)
+        if record:
+            name_widget = ttk.Entry(form, textvariable=values['name'])
+        else:
+            names = self.service.catalogs()['models']
+            name_widget = ttk.Combobox(form, textvariable=values['name'], values=names, state='readonly')
+            if not names:
+                name_widget.configure(state='disabled')
+        def refresh_catalog_widgets():
+            catalogs = self.service.catalogs()
+            name_widget.configure(values=catalogs['models'], state='readonly' if catalogs['models'] else 'disabled')
+            if values['name'].get() not in catalogs['models']:
+                values['name'].set('')
+            if not record:
+                printers_widget.delete(0, 'end')
+                for printer_name in catalogs['printers']:
+                    printers_widget.insert('end', printer_name)
+        if not record:
+            ttk.Button(form, text=self.t('Управление справочниками'),
+                       command=lambda: CatalogDialog(self, win, refresh_catalog_widgets),
+                       style='Glass.TButton').grid(row=2, column=1, sticky='w', pady=(0, 5))
+        name_widget.grid(row=1, column=1, sticky='ew', pady=10)
+        ttk.Label(form, text=self.t('Подходящие принтеры'), style='Content.TLabel').grid(row=3, column=0, sticky='nw', padx=(0, 14), pady=10)
+        if record:
+            printers_widget = ttk.Entry(form, textvariable=values['printers'])
+            printers_widget.grid(row=3, column=1, sticky='ew', pady=10)
+        else:
+            printers = self.service.catalogs()['printers']
+            list_frame = ttk.Frame(form, style='Content.TFrame')
+            list_frame.grid(row=3, column=1, sticky='nsew', pady=10)
+            list_frame.columnconfigure(0, weight=1)
+            list_frame.rowconfigure(0, weight=1)
+            printers_widget = tk.Listbox(list_frame, selectmode='multiple', exportselection=False,
+                height=max(3, min(6, len(printers))), activestyle='none', font=visual_theme.FONT,
+                bg=COLORS['surface'], fg=COLORS['text'], selectbackground=COLORS['accent'],
+                selectforeground='white', relief='flat', highlightthickness=1,
+                highlightbackground=COLORS['border'], highlightcolor=COLORS['focus'])
+            printer_scroll = ttk.Scrollbar(list_frame, orient='vertical', command=printers_widget.yview)
+            printers_widget.configure(yscrollcommand=printer_scroll.set)
+            printers_widget.grid(row=0, column=0, sticky='nsew')
+            printer_scroll.grid(row=0, column=1, sticky='ns')
+            for printer in printers:
+                printers_widget.insert('end', printer)
+            if not printers:
+                ttk.Label(list_frame, text=self.t('Список принтеров можно дополнить в настройках.'),
+                          style='ContentMuted.TLabel', wraplength=350).grid(row=1, column=0, sticky='w', pady=5)
         note = ttk.Label(form, text=self.t('* Обязательные поля. ID после создания не меняется.\nНаименование и принтеры меняются только у этого экземпляра.'), style='ContentMuted.TLabel', wraplength=max(240, min(490, self.root.winfo_screenwidth() - 120)))
-        note.grid(row=3, column=0, columnspan=2, sticky='w', pady=18)
+        note.grid(row=4, column=0, columnspan=2, sticky='w', pady=18)
         def save():
             try:
-                args = [values[k].get() for k in ('id', 'name', 'printers')]
+                printers_value = (values['printers'].get() if record else
+                    '; '.join(printers_widget.get(i) for i in printers_widget.curselection()))
+                args = [values['id'].get(), values['name'].get(), printers_value]
                 if record:
                     self.service.edit(*args)
                 else:
@@ -481,7 +551,7 @@ class App:
             except Exception as error:
                 self._error(error, win)
         buttons = ttk.Frame(form)
-        buttons.grid(row=4, column=0, columnspan=2, sticky='e')
+        buttons.grid(row=5, column=0, columnspan=2, sticky='e')
         ttk.Button(buttons, text=self.t('Отмена'), command=win.destroy).pack(side='left', padx=8)
         ttk.Button(buttons, text=self.t('Сохранить'), command=save, style='Primary.TButton').pack(side='left')
         win.bind('<Escape>', lambda event: win.destroy())
@@ -582,6 +652,7 @@ class App:
                              self.t('Добавлен: {id} — {name}', id=record['id'], name=record['name']), 'GlassSuccess.TLabel')
         except Exception as error:
             transition_label(self.root, self.batch_feedback, translate_error(getattr(self, 'language', 'ru'), error), 'GlassError.TLabel')
+            self._play_error_voice(error)
         return 'break'
 
     def _commit_operation_batch(self):
@@ -611,6 +682,7 @@ class App:
                              result + self.t('Можно сканировать следующую партию.'), 'GlassSuccess.TLabel')
         except Exception as error:
             transition_label(self.root, self.batch_feedback, translate_error(getattr(self, 'language', 'ru'), error), 'GlassError.TLabel')
+            self._play_error_voice(error)
 
     def show_profile(self):
         self.current_screen = 'profile'
@@ -672,10 +744,43 @@ class App:
         path = filedialog.asksaveasfilename(parent=self.root, title=self.t('Экспорт текущего списка'), defaultextension='.xlsx', initialfile=self.t('Склад-') + date.today().isoformat() + '.xlsx', filetypes=[(self.t('Книга Excel'), '*.xlsx')])
         if path:
             try:
-                export_inventory(self.rows, path, profile=self.service.profile())
-                self.show_dialog(self.t('Экспорт'), self.t('Экспортировано экземпляров: {count}\n{path}', count=format_number(len(self.rows), self.language), path=path))
+                records = self.service.list()
+                export_inventory(records, path, profile=self.service.profile())
+                self.show_dialog(self.t('Экспорт'), self.t('Экспортировано экземпляров: {count}\n{path}', count=format_number(len(records), self.language), path=path))
             except Exception as error:
                 self._error(error)
+
+    def import_inventory(self):
+        path = filedialog.askopenfilename(parent=self.root, title=self.t('Импорт XLSX'),
+            filetypes=[(self.t('Книга Excel'), '*.xlsx')])
+        if not path:
+            return
+        try:
+            records = import_inventory_xlsx(path)
+            prepared = self.service.preview_inventory_import(records)
+            examples = '\n'.join(
+                f'{item["id"]} · {item["name"]} · {self.t(item["status"])} · '
+                f'{format_date(item["operation_date"], self.language)}'
+                for item in prepared[:8])
+            if len(prepared) > 8:
+                examples += self.t('\n… и ещё {count}', count=format_number(len(prepared) - 8, self.language))
+            summary = self.t(
+                'Будут добавлены новые экземпляры: {count}.\n\n{examples}\n\n'
+                'Склад будет дополнен, существующие записи не обновляются. Если хотя бы один ID '
+                'уже занят, импорт целиком отменяется. Старый журнал операций и профиль из XLSX '
+                'не переносятся; у статуса «На заправке» семидневный срок утери также не восстановится, '
+                'так как в XLSX нет точного времени отправления. Текущий профиль останется без изменений. '
+                'Для переноса на том же '
+                'компьютере безопаснее обновить EXE: программа мигрирует базу вместе с журналом.\n\nПродолжить?',
+                count=format_number(len(prepared), self.language), examples=examples)
+            if not self.ask_confirmation(self.t('Проверка импорта склада'), summary):
+                return
+            count = self.service.import_inventory(prepared, source_name=path.replace('\\', '/').rsplit('/', 1)[-1])
+            self.refresh()
+            self.show_dialog(self.t('Импорт склада завершён'),
+                             self.t('Добавлено экземпляров: {count}.', count=format_number(count, self.language)))
+        except Exception as error:
+            self._error(error)
 
     def show_history(self):
         self.current_screen = 'history'
@@ -695,7 +800,8 @@ class App:
                    'write_off': self.t('Списание'), 'Списание': self.t('Списание'),
                    'remove': self.t('Удаление со склада'), 'Удаление со склада': self.t('Удаление со склада'),
                    'lost': self.t('Автоматическое признание утерянным'),
-                   'Автоматическое признание утерянным': self.t('Автоматическое признание утерянным')}
+                   'Автоматическое признание утерянным': self.t('Автоматическое признание утерянным'),
+                   'import': self.t('Импорт из Excel'), 'Импорт из Excel': self.t('Импорт из Excel')}
         for row in rows:
             values = []
             for column in columns:
@@ -781,4 +887,7 @@ class App:
             self._batch_dates[action] = value
 
     def _operation_date(self):
-        return parse_date_input(self.batch_date.get(), getattr(self, 'language', 'ru'))
+        try:
+            return parse_date_input(self.batch_date.get(), getattr(self, 'language', 'ru'))
+        except ValueError as error:
+            raise ValidationError(str(error), error_codes.INVALID_OPERATION_DATE) from error

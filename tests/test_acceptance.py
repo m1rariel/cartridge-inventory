@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from cartridge_app.service import Service, ValidationError
+from cartridge_app import error_codes
 from cartridge_app.storage import Storage
 from cartridge_app.xlsx import export_inventory
 
@@ -58,6 +59,61 @@ class AcceptanceTests(unittest.TestCase):
         self.service.add('0002', 'Одна модель')
         with self.assertRaisesRegex(ValidationError, 'уже существует'):
             self.service.add('0001', 'Другая модель')
+
+    def test_catalog_crud_merge_and_stock_independence(self):
+        self.service.add_catalog_name('model', 'LaserJet Pro')
+        self.service.add_catalog_name('printer', 'HP M404')
+        self.service.add('0001', 'LaserJet Pro', 'HP M404')
+        self.service.add('0002', 'LaserJet Pro')
+        with self.assertRaisesRegex(ValidationError, 'уже есть'):
+            self.service.add_catalog_name('model', 'laserjet pro')
+        self.service.rename_catalog_name('model', 'LaserJet Pro', 'LaserJet 400')
+        self.assertEqual(self.service.get('0001')['name'], 'LaserJet Pro')
+        self.assertEqual(self.service.catalogs()['models'], ['LaserJet 400'])
+        added = self.service.merge_catalogs({'version': 1,
+            'models': ['LaserJet 400', 'OfficeJet'], 'printers': ['HP M404', 'Canon LBP']})
+        self.assertEqual(added, {'models': 1, 'printers': 1})
+        self.service.delete_catalog_name('printer', 'HP M404')
+        self.assertEqual(self.service.get('0001')['printers'], 'HP M404')
+        self.restart()
+        self.assertIn('OfficeJet', self.service.catalogs()['models'])
+        with self.assertRaisesRegex(ValidationError, 'Формат'):
+            self.service.merge_catalogs({'version': 2, 'models': [], 'printers': []})
+
+    def test_voice_error_codes_follow_status_priority_without_changing_messages(self):
+        self.service.add('0001', 'Модель')
+        with self.assertRaises(ValidationError) as missing:
+            self.service.preview_transition('unknown', 'send', self.today)
+        self.assertEqual(missing.exception.voice_code, error_codes.CARTRIDGE_NOT_FOUND)
+        with self.assertRaises(ValidationError) as not_ready:
+            self.service.preview_transition('0001', 'receive', self.today)
+        self.assertEqual(not_ready.exception.voice_code, error_codes.ARRIVAL_NOT_AT_REFILL)
+        with self.assertRaises(ValidationError) as bad_date:
+            self.service.preview_transition('0001', 'send', 'not-a-date')
+        self.assertEqual(bad_date.exception.voice_code, error_codes.INVALID_OPERATION_DATE)
+        self.service.operate('0001', 'send', self.today)
+        with self.assertRaises(ValidationError) as dispatched:
+            self.service.preview_transition('0001', 'send', self.today)
+        self.assertEqual(dispatched.exception.voice_code, error_codes.DISPATCH_NOT_READY)
+        self.service.operate('0001', 'write_off', self.today, confirmed=True)
+        with self.assertRaises(ValidationError) as written_off:
+            self.service.edit('0001', 'Изменённая модель')
+        self.assertEqual(written_off.exception.voice_code, error_codes.WRITTEN_OFF_ACTION_BLOCKED)
+        with self.assertRaises(ValidationError) as written_off_transition:
+            self.service.preview_transition('0001', 'send', self.today)
+        self.assertEqual(written_off_transition.exception.voice_code,
+                         error_codes.WRITTEN_OFF_ACTION_BLOCKED)
+        self.service.add('0002', 'Модель')
+        with self.storage.transaction():
+            self.storage.update_cartridge('0002', {'status': 'Утерян'})
+        with self.assertRaises(ValidationError) as lost:
+            self.service.preview_transition('0002', 'receive', self.today)
+        self.assertEqual(lost.exception.voice_code, error_codes.LOST_ACTION_BLOCKED)
+
+    def test_catalog_missing_voice_code(self):
+        with self.assertRaises(ValidationError) as missing:
+            self.service.rename_catalog_name('model', 'нет', 'новое')
+        self.assertEqual(missing.exception.voice_code, error_codes.CATALOG_NAME_NOT_FOUND)
 
     def test_remove_from_stock_preserves_history_and_reserves_id(self):
         self.service.save_profile('Организация', 'Ответственный')
@@ -159,7 +215,7 @@ class AcceptanceTests(unittest.TestCase):
             CREATE INDEX history_cartridge ON history(cartridge_id, id);
         ''')
         connection.execute('INSERT INTO cartridges(id,name,printers,status,operation_date) VALUES(?,?,?,?,?)',
-                           ('0007', 'Старая модель', '', 'Готов', self.today))
+                           ('0007', 'Старая модель', 'HP 1010, Canon LBP', 'Готов', self.today))
         connection.execute('PRAGMA application_id=1128354388')
         connection.execute('PRAGMA user_version=1')
         connection.commit()
@@ -170,15 +226,29 @@ class AcceptanceTests(unittest.TestCase):
         self._make_v1_database(legacy_path)
         legacy = Storage(legacy_path)
         try:
-            self.assertEqual(legacy.connection.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(legacy.connection.execute('PRAGMA user_version').fetchone()[0], 3)
             migrated_service = Service(legacy)
             self.assertEqual(migrated_service.get('0007')['name'], 'Старая модель')
             self.assertEqual(migrated_service.profile()['organization'], 'Старая организация')
+            self.assertEqual(migrated_service.catalogs()['models'], ['Старая модель'])
+            self.assertEqual(migrated_service.catalogs()['printers'], ['Canon LBP', 'HP 1010'])
         finally:
             legacy.close()
         self.service.restore(legacy_path)
         self.assertEqual(self.service.get('0007')['name'], 'Старая модель')
         self.assertEqual(self.service.profile()['full_name'], 'Старый сотрудник')
+
+    def test_v2_database_migration_seeds_catalogs_without_changing_stock(self):
+        self.service.add('0008', 'Офисная модель', 'HP 1; Canon 2')
+        self.storage.close()
+        raw = sqlite3.connect(self.path)
+        raw.executescript('DROP TABLE cartridge_models; DROP TABLE printers; PRAGMA user_version=2;')
+        raw.close()
+        self.storage = Storage(self.path)
+        self.service = Service(self.storage)
+        self.assertEqual(self.service.get('0008')['printers'], 'HP 1; Canon 2')
+        self.assertEqual(self.service.catalogs(), {
+            'models': ['Офисная модель'], 'printers': ['Canon 2', 'HP 1']})
 
     def test_required_fields_and_numeric_id(self):
         for args in [('', 'Модель'), ('1', ' '), (1, 'Модель')]:
@@ -368,10 +438,13 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(self.service.get('1')['status'], 'Готов')
         self.assertEqual(self.service.get('1')['name'], 'A')
         self.assertIsNone(self.storage.get_cartridge('2'))
+        self.assertNotIn('B', self.service.catalogs()['models'])
         self.assertEqual(len(self.service.history()), 1)
 
     def test_backup_restore_and_safety_copy(self):
         self.service.save_profile('Компания', 'Сотрудник')
+        self.service.add_catalog_name('model', 'A')
+        self.service.add_catalog_name('printer', 'HP 1')
         self.service.add('0001', 'A')
         backup = self.service.backup(self.directory / 'backup.sqlite3')
         self.service.operate('0001', 'send', self.today)
@@ -381,11 +454,13 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(len(self.service.list()), 1)
         self.assertEqual(self.service.get('0001')['status'], 'Готов')
         self.assertEqual(self.service.profile()['organization'], 'Компания')
+        self.assertEqual(self.service.catalogs(), {'models': ['A'], 'printers': ['HP 1']})
         self.restart()
         self.assertEqual(len(self.service.history()), 1)
         self.service.restore(safety)
         self.assertEqual(len(self.service.list()), 2)
         self.assertEqual(self.service.get('0001')['status'], 'На заправке')
+        self.assertIn('HP 1', self.service.catalogs()['printers'])
 
     def test_bad_restore_and_self_backup_preserve_data(self):
         self.service.add('1', 'A')

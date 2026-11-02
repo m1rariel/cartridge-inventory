@@ -7,12 +7,13 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 import os
+import re
 import sqlite3
 import tempfile
 import uuid
 
 APPLICATION_ID = 0x43415254
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATUSES = ('Готов', 'На заправке', 'Списан', 'Утерян')
 CARTRIDGE_COLUMNS = ('id', 'name', 'printers', 'status', 'operation_date')
 HISTORY_COLUMNS = ('cartridge_id', 'action', 'old_status', 'new_status',
@@ -22,7 +23,11 @@ EXPECTED_COLUMNS = {
     'cartridges': CARTRIDGE_COLUMNS + ('removed_at',),
     'profile': ('id', 'organization', 'full_name'),
     'history': ('id',) + HISTORY_COLUMNS,
+    'cartridge_models': ('name',),
+    'printers': ('name',),
 }
+EXPECTED_COLUMNS_V2 = {key: value for key, value in EXPECTED_COLUMNS.items()
+                       if key not in ('cartridge_models', 'printers')}
 LEGACY_COLUMNS_V1 = {
     'cartridges': CARTRIDGE_COLUMNS,
     'profile': ('id', 'organization', 'full_name'),
@@ -57,6 +62,12 @@ CREATE TABLE history (
  details TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX history_cartridge ON history(cartridge_id, id);
+CREATE TABLE cartridge_models (
+ name TEXT PRIMARY KEY NOT NULL CHECK(length(trim(name))>0)
+);
+CREATE TABLE printers (
+ name TEXT PRIMARY KEY NOT NULL CHECK(length(trim(name))>0)
+);
 """
 
 
@@ -162,6 +173,39 @@ class Storage:
             args = (cartridge_id,)
         return [dict(row) for row in self.connection.execute(sql + ' ORDER BY id DESC', args)]
 
+    def list_catalog(self, kind):
+        table = self._catalog_table(kind)
+        return [row[0] for row in self.connection.execute(
+            'SELECT name FROM ' + table + ' ORDER BY name COLLATE NOCASE, name')]
+
+    @staticmethod
+    def _catalog_table(kind):
+        if kind == 'model':
+            return 'cartridge_models'
+        if kind == 'printer':
+            return 'printers'
+        raise ValueError('Неизвестный справочник.')
+
+    def add_catalog_name(self, kind, name):
+        self._require_transaction()
+        table = self._catalog_table(kind)
+        self.connection.execute('INSERT INTO ' + table + '(name) VALUES(?)', (name,))
+
+    def rename_catalog_name(self, kind, old_name, new_name):
+        self._require_transaction()
+        table = self._catalog_table(kind)
+        cursor = self.connection.execute('UPDATE ' + table + ' SET name=? WHERE name=?',
+                                         (new_name, old_name))
+        if cursor.rowcount != 1:
+            raise ValueError('Наименование не найдено в справочнике.')
+
+    def delete_catalog_name(self, kind, name):
+        self._require_transaction()
+        table = self._catalog_table(kind)
+        cursor = self.connection.execute('DELETE FROM ' + table + ' WHERE name=?', (name,))
+        if cursor.rowcount != 1:
+            raise ValueError('Наименование не найдено в справочнике.')
+
     @staticmethod
     def _validate(connection):
         """Reject foreign, corrupt and unsupported databases before changing live data."""
@@ -207,37 +251,73 @@ class Storage:
                     raise ValueError()
             except (ValueError, TypeError):
                 raise ValueError('Некорректное время записи в журнале.') from None
+        for table in ('cartridge_models', 'printers'):
+            names = [row[0] for row in connection.execute('SELECT name FROM ' + table)]
+            if (not all(isinstance(name, str) and name.strip() for name in names)
+                    or len({name.casefold() for name in names}) != len(names)):
+                raise ValueError('Справочник картриджей или принтеров повреждён.')
 
     @staticmethod
     def _upgrade_legacy(connection):
-        """Apply the known v1→v2 soft-removal migration without replacing user data."""
+        """Upgrade v1/v2 databases while preserving stock and history."""
         version = connection.execute('PRAGMA user_version').fetchone()[0]
         if version == SCHEMA_VERSION:
             return
-        if version != 1 or connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID:
+        if version not in (1, 2) or connection.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID:
             raise ValueError('Версия базы данных не поддерживается этой версией программы.')
-        for table, expected in LEGACY_COLUMNS_V1.items():
-            actual = tuple(row[1] for row in connection.execute('PRAGMA table_info(' + table + ')'))
-            if actual != expected:
-                raise ValueError('Структура старой базы данных не соответствует приложению; миграция отменена.')
-        objects = connection.execute(
-            "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
-        allowed = {('table', name) for name in LEGACY_COLUMNS_V1} | {('index', 'history_cartridge')}
-        if any(tuple(row) not in allowed for row in objects):
-            raise ValueError('Старая база содержит неподдерживаемые объекты; миграция отменена.')
-        if [row[0] for row in connection.execute('PRAGMA integrity_check')] != ['ok']:
-            raise ValueError('База данных повреждена; миграция отменена.')
-        if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
-            raise ValueError('В базе нарушены связи журнала и картриджей; миграция отменена.')
+        if version == 1:
+            Storage._validate_legacy_shape(connection, LEGACY_COLUMNS_V1)
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                connection.execute('ALTER TABLE cartridges ADD COLUMN removed_at TEXT')
+                connection.execute('PRAGMA user_version=2')
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+        Storage._validate_legacy_shape(connection, EXPECTED_COLUMNS_V2)
         connection.execute('BEGIN IMMEDIATE')
         try:
-            connection.execute('ALTER TABLE cartridges ADD COLUMN removed_at TEXT')
+            connection.execute('''CREATE TABLE cartridge_models (
+                name TEXT PRIMARY KEY NOT NULL CHECK(length(trim(name))>0))''')
+            connection.execute('''CREATE TABLE printers (
+                name TEXT PRIMARY KEY NOT NULL CHECK(length(trim(name))>0))''')
+            model_names = set()
+            for row in connection.execute('SELECT name FROM cartridges ORDER BY id'):
+                name = row[0].strip()
+                if name and name.casefold() not in model_names:
+                    connection.execute('INSERT INTO cartridge_models(name) VALUES(?)', (name,))
+                    model_names.add(name.casefold())
+            printer_names = set()
+            for row in connection.execute('SELECT printers FROM cartridges ORDER BY id'):
+                for value in re.split(r'[,;\n]+', row[0] or ''):
+                    name = value.strip()
+                    if name and name.casefold() not in printer_names:
+                        connection.execute('INSERT INTO printers(name) VALUES(?)', (name,))
+                        printer_names.add(name.casefold())
             connection.execute('PRAGMA user_version=%d' % SCHEMA_VERSION)
             Storage._validate(connection)
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
+
+    @staticmethod
+    def _validate_legacy_shape(connection, expected_columns):
+        for table, expected in expected_columns.items():
+            actual = tuple(row[1] for row in connection.execute('PRAGMA table_info(' + table + ')'))
+            if actual != expected:
+                raise ValueError('Структура старой базы данных не соответствует приложению; миграция отменена.')
+        objects = connection.execute(
+            "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+        allowed = {('table', name) for name in expected_columns} | {('index', 'history_cartridge')}
+        if any(tuple(row) not in allowed for row in objects):
+            raise ValueError('Старая база содержит неподдерживаемые объекты; миграция отменена.')
+        if [row[0] for row in connection.execute('PRAGMA integrity_check')] != ['ok']:
+            raise ValueError('База данных повреждена; миграция отменена.')
+        if connection.execute('PRAGMA foreign_key_check').fetchone() is not None:
+            raise ValueError('В базе нарушены связи журнала и картриджей; миграция отменена.')
 
     @staticmethod
     def _validate_date(value):

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "cartridge_not_found",
+    "file": "cartridge_not_found.mp3",
+    "text": "Картридж не найден.",
+    "duration_seconds": 2.011406
+  },
+  {
+    "id": "dispatch_not_ready",
+    "file": "dispatch_not_ready.mp3",
+    "text": "Отправление недоступно: картридж не готов.",
+    "duration_seconds": 3.78775
+  },
+  {
+    "id": "arrival_not_at_refill",
+    "file": "arrival_not_at_refill.mp3",
+    "text": "Прибытие недоступно: картридж не находится на заправке.",
+    "duration_seconds": 4.257938
+  },
+  {
+    "id": "written_off_action_blocked",
+    "file": "written_off_action_blocked.mp3",
+    "text": "Списанный картридж нельзя отправить, принять или отредактировать.",
+    "duration_seconds": 4.649781
+  },
+  {
+    "id": "lost_action_blocked",
+    "file": "lost_action_blocked.mp3",
+    "text": "Утерянный картридж нельзя отправить, принять или списать.",
+    "duration_seconds": 4.440813
+  },
+  {
+    "id": "invalid_operation_date",
+    "file": "invalid_operation_date.mp3",
+    "text": "Дата операции указана неверно.",
+    "duration_seconds": 2.638344
+  },
+  {
+    "id": "catalog_name_not_found",
+    "file": "catalog_name_not_found.mp3",
+    "text": "Наименование не найдено в справочнике.",
+    "duration_seconds": 3.108563
+  },
+  {
+    "id": "data_read_write_failed",
+    "file": "data_read_write_failed.mp3",
+    "text": "Не удалось прочитать или сохранить данные. Проверьте доступ к файлу и свободное место.",
+    "duration_seconds": 5.146094
+  }
+]
