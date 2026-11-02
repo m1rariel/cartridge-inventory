@@ -2,10 +2,130 @@
 import tkinter as tk
 from tkinter import colorchooser, filedialog, ttk
 from datetime import date
+import json
+from pathlib import Path
 
 from .localization import tr, translate_error
 from .preferences import FONT_FAMILIES, color_contrast, effective_theme, recommended_text_color
 from .visual import COLORS
+from .catalog_xlsx import export_catalogs_xlsx, import_catalogs_xlsx
+
+
+class CatalogDialog:
+    """Small local editor for cartridge model and printer pick lists."""
+    def __init__(self, app, parent, on_close=None):
+        self.app, self.parent = app, parent
+        self.on_close = on_close
+        self.window = tk.Toplevel(parent)
+        self.window.title(self.t('Справочники картриджей и принтеров'))
+        self.window.transient(parent)
+        self.window.geometry('640x500')
+        self.window.minsize(340, 360)
+        self.window.protocol('WM_DELETE_WINDOW', self.close)
+        self.window.bind('<Escape>', lambda _event: self.close())
+        self.window.grab_set()
+        self.notebook = ttk.Notebook(self.window)
+        self.notebook.pack(fill='both', expand=True, padx=14, pady=14)
+        self.tabs = {}
+        for kind, label in (('model', 'Картриджи'), ('printer', 'Принтеры')):
+            frame = ttk.Frame(self.notebook, style='Content.TFrame', padding=14)
+            self.notebook.add(frame, text=self.t(label))
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            listing = tk.Listbox(frame, exportselection=False, activestyle='none',
+                                 font=('TkDefaultFont', 11), height=12)
+            scroll = ttk.Scrollbar(frame, orient='vertical', command=listing.yview)
+            listing.configure(yscrollcommand=scroll.set)
+            listing.grid(row=0, column=0, columnspan=2, sticky='nsew')
+            scroll.grid(row=0, column=2, sticky='ns')
+            entry = ttk.Entry(frame)
+            entry.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(12, 8))
+            buttons = ttk.Frame(frame, style='Content.TFrame')
+            buttons.grid(row=2, column=0, columnspan=3, sticky='ew')
+            ttk.Button(buttons, text=self.t('Добавить'), command=lambda k=kind: self.add(k)).pack(side='left')
+            ttk.Button(buttons, text=self.t('Переименовать'), command=lambda k=kind: self.rename(k)).pack(side='left', padx=6)
+            ttk.Button(buttons, text=self.t('Удалить из списка'), command=lambda k=kind: self.delete(k),
+                       style='Danger.TButton').pack(side='left')
+            listing.bind('<<ListboxSelect>>', lambda _e, k=kind: self.select(k))
+            listing.bind('<Double-Button-1>', lambda _e, k=kind: self.select(k))
+            entry.bind('<Return>', lambda _e, k=kind: self.add(k))
+            self.tabs[kind] = (listing, entry)
+        self.refresh()
+        self.window.after_idle(lambda: self.tabs['model'][1].focus_set())
+
+    def t(self, text, **values):
+        return self.app.t(text, **values)
+
+    def selected_kind(self):
+        return 'printer' if self.notebook.index(self.notebook.select()) == 1 else 'model'
+
+    def refresh(self):
+        names = self.app.service.catalogs()
+        for kind, key in (('model', 'models'), ('printer', 'printers')):
+            listing = self.tabs[kind][0]
+            listing.delete(0, 'end')
+            for name in names[key]:
+                listing.insert('end', name)
+
+    def select(self, kind):
+        listing, entry = self.tabs[kind]
+        selection = listing.curselection()
+        if selection:
+            entry.delete(0, 'end')
+            entry.insert(0, listing.get(selection[0]))
+
+    def add(self, kind):
+        try:
+            self.app.service.add_catalog_name(kind, self.tabs[kind][1].get())
+            self.tabs[kind][1].delete(0, 'end')
+            self.refresh()
+        except Exception as error:
+            self.app.show_error(error, self.window)
+
+    def rename(self, kind):
+        listing, entry = self.tabs[kind]
+        selection = listing.curselection()
+        if not selection:
+            self.app.show_error(self.t('Выберите наименование в списке.'), self.window)
+            return
+        try:
+            self.app.service.rename_catalog_name(kind, listing.get(selection[0]), entry.get())
+            self.refresh()
+        except Exception as error:
+            self.app.show_error(error, self.window)
+
+    def delete(self, kind):
+        listing, _entry = self.tabs[kind]
+        selection = listing.curselection()
+        if not selection:
+            self.app.show_error(self.t('Выберите наименование в списке.'), self.window)
+            return
+        name = listing.get(selection[0])
+        if not self.app.ask_confirmation(self.t('Удалить из справочника?'),
+                self.t('Наименование «{name}» будет убрано из списка выбора. Складские записи останутся без изменений.', name=name), parent=self.window):
+            return
+        try:
+            self.app.service.delete_catalog_name(kind, name)
+            self.refresh()
+        except Exception as error:
+            self.app.show_error(error, self.window)
+
+    def close(self):
+        try:
+            self.window.grab_release()
+            self.window.destroy()
+        except tk.TclError:
+            pass
+        try:
+            if self.parent.winfo_exists():
+                self.parent.grab_set()
+        except tk.TclError:
+            pass
+        if self.on_close:
+            try:
+                self.on_close()
+            except Exception as error:
+                self.app.show_error(error, self.parent)
 
 
 class SettingsDialog:
@@ -106,6 +226,9 @@ class SettingsDialog:
                                        command=lambda: self._save(theme='light' if effective_theme(settings.theme) == 'dark' else 'dark'),
                                        style='Glass.TButton')
         self.theme_button.pack(fill='x', pady=(0, 8))
+        sound_enabled = tk.BooleanVar(value=settings.sound_enabled)
+        ttk.Checkbutton(self.content, text=self.t('Озвучивать ошибки'), variable=sound_enabled,
+                        command=lambda: self._save(sound_enabled=sound_enabled.get())).pack(anchor='w', pady=(0, 8))
 
         family = tk.StringVar(value=settings.font_family)
         self._row('Шрифт', lambda parent: ttk.Combobox(parent, textvariable=family,
@@ -157,6 +280,20 @@ class SettingsDialog:
         elif settings.background_mode == 'custom':
             ttk.Button(self.content, text=self.t('Удалить пользовательский фон'), command=self.reset_background,
                        style='Danger.TButton').pack(anchor='w', pady=6)
+
+        self._section('Справочники картриджей и принтеров')
+        ttk.Label(self.content, text=self.t('Списки для выбора при добавлении экземпляров. Резервная копия базы включает справочники.'),
+                  style='ContentMuted.TLabel', wraplength=560, justify='left').pack(anchor='w', pady=(0, 8))
+        ttk.Button(self.content, text=self.t('Управление справочниками'), command=self.open_catalogs,
+                   style='Glass.TButton').pack(fill='x', pady=3)
+        catalog_actions = ttk.Frame(self.content, style='Content.TFrame')
+        catalog_actions.pack(fill='x', pady=3)
+        ttk.Button(catalog_actions, text=self.t('Экспорт JSON'), command=self.export_catalogs,
+                   style='Glass.TButton').pack(side='left', fill='x', expand=True)
+        ttk.Button(catalog_actions, text=self.t('Экспорт Excel'), command=self.export_catalogs_xlsx,
+                   style='Glass.TButton').pack(side='left', fill='x', expand=True, padx=(8, 0))
+        ttk.Button(catalog_actions, text=self.t('Импорт JSON/Excel'), command=self.import_catalogs,
+                   style='Glass.TButton').pack(side='left', fill='x', expand=True, padx=(8, 0))
 
         self._section('Язык')
         language = tk.StringVar(value=settings.language)
@@ -228,6 +365,54 @@ class SettingsDialog:
             if 'language' in changes and hasattr(self.app, 'settings_button'):
                 self.return_focus = self.app.settings_button
             self.rebuild()
+
+    def open_catalogs(self):
+        CatalogDialog(self.app, self.window)
+
+    def export_catalogs(self):
+        path = filedialog.asksaveasfilename(parent=self.window, title=self.t('Экспорт справочников'),
+            defaultextension='.json', initialfile='Справочники-картриджей.json',
+            filetypes=[(self.t('Файл JSON'), '*.json')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as output:
+                json.dump(dict(version=1, **self.app.service.catalogs()), output,
+                          ensure_ascii=False, indent=2)
+            self.app.show_dialog(self.t('Экспорт справочников'), self.t('Справочники экспортированы:\n') + path,
+                                 parent=self.window)
+        except Exception as error:
+            self.app.show_error(error, self.window)
+
+    def export_catalogs_xlsx(self):
+        path = filedialog.asksaveasfilename(parent=self.window, title=self.t('Экспорт справочников'),
+            defaultextension='.xlsx', initialfile='Справочники-картриджей.xlsx',
+            filetypes=[(self.t('Книга Excel'), '*.xlsx')])
+        if not path:
+            return
+        try:
+            export_catalogs_xlsx(self.app.service.catalogs(), path)
+            self.app.show_dialog(self.t('Экспорт справочников'), self.t('Справочники экспортированы:\n') + path,
+                                 parent=self.window)
+        except Exception as error:
+            self.app.show_error(error, self.window)
+
+    def import_catalogs(self):
+        path = filedialog.askopenfilename(parent=self.window, title=self.t('Импорт справочников'),
+            filetypes=[(self.t('Книга Excel'), '*.xlsx'), (self.t('Файл JSON'), '*.json'),
+                       (self.t('Все файлы'), '*')])
+        if not path:
+            return
+        try:
+            if Path(path).suffix.lower() == '.xlsx':
+                payload = import_catalogs_xlsx(path)
+            else:
+                with open(path, 'r', encoding='utf-8-sig') as source:
+                    payload = json.load(source)
+            added = self.app.service.merge_catalogs(payload)
+            self.app.show_dialog(self.t('Импорт справочников'), self.t('Добавлено моделей: {models}; принтеров: {printers}. Существующие записи сохранены.', **added), parent=self.window)
+        except Exception as error:
+            self.app.show_error(error, self.window)
 
     def choose_background(self):
         path = filedialog.askopenfilename(parent=self.window, title=self.t('Выбрать изображение'),

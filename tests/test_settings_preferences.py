@@ -38,7 +38,7 @@ class PreferencesAcceptanceTests(unittest.TestCase):
             'font_family': 'invented', 'accent_color': 'red',
             'text_color_light': '#ABCDEF', 'text_color_dark': '#xyzxyz',
             'background_mode': 'custom', 'background_filename': '../external.png',
-            'background_overlay': 81,
+            'background_overlay': 81, 'sound_enabled': 'off',
         }}), encoding='utf-8')
         settings = self.store.load()
         self.assertEqual(settings.theme, 'dark')
@@ -51,6 +51,14 @@ class PreferencesAcceptanceTests(unittest.TestCase):
         self.assertEqual(settings.background_mode, 'default')
         self.assertIsNone(settings.background_filename)
         self.assertEqual(settings.background_overlay, self.defaults.background_overlay)
+        self.assertEqual(settings.sound_enabled, True)
+
+    def test_sound_preference_persists_and_rejects_non_boolean_values(self):
+        settings = self.store.update(sound_enabled=False)
+        self.assertFalse(settings.sound_enabled)
+        self.assertFalse(PreferencesStore(self.root).load().sound_enabled)
+        with self.assertRaises(ValueError):
+            self.store.update(sound_enabled='false')
 
     def test_preferences_persist_after_new_store_and_reset_preserves_inventory(self):
         # Independent settings/reset must never modify any neighbouring business file.

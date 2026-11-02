@@ -71,6 +71,7 @@ class Settings:
     background_mode: str = 'default'
     background_filename: Optional[str] = None
     background_overlay: int = 38
+    sound_enabled: bool = True
 
 
 def default_settings() -> Settings:
@@ -116,6 +117,8 @@ def _validated(value: Any, defaults: Settings) -> Settings:
         data['background_mode'] = 'default'
     if type(data['background_overlay']) is not int or not -80 <= data['background_overlay'] <= 80:
         data['background_overlay'] = defaults.background_overlay
+    if type(data['sound_enabled']) is not bool:
+        data['sound_enabled'] = defaults.sound_enabled
     return Settings(**data)
 
 
@@ -183,6 +186,8 @@ class PreferencesStore:
                 raise ValueError('Выберите шрифт из списка.')
             if name == 'background_mode' and value not in ('default', 'custom'):
                 raise ValueError('Неизвестный режим фона.')
+            if name == 'sound_enabled' and type(value) is not bool:
+                raise ValueError('Настройка озвучивания должна быть логическим значением.')
         candidate = _validated(data, self._defaults)
         _atomic_json(self.path, {'version': PREFERENCE_VERSION, 'settings': asdict(candidate)})
         self.settings = candidate

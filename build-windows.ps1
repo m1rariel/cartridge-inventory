@@ -7,7 +7,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать окруж�
 if ($LASTEXITCODE -ne 0) { throw 'Не удалось установить средства сборки.' }
 & .\.venv-build\Scripts\python.exe -m unittest discover -s tests -v
 if ($LASTEXITCODE -ne 0) { throw 'Тесты не прошли.' }
-& .\.venv-build\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onefile --collect-all PIL --name CartridgeAccounting --distpath dist-onefile --workpath build-onefile run.py
+& .\.venv-build\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onefile --collect-all PIL --add-data "cartridge-voices-grigory;cartridge-voices-grigory" --name CartridgeAccounting --distpath dist-onefile --workpath build-onefile run.py
 if ($LASTEXITCODE -ne 0) { throw 'Сборка не выполнена.' }
 Copy-Item README.md dist-onefile\ИНСТРУКЦИЯ.md
 New-Item -ItemType Directory -Force dist | Out-Null

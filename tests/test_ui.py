@@ -1,16 +1,38 @@
 """Callback checks without display; opt-in real Tk smoke on supported desktops."""
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from cartridge_app.service import Service
+from cartridge_app.service import ValidationError
+from cartridge_app import error_codes
 from cartridge_app.storage import Storage
 from cartridge_app.ui import App
 
 
 class CallbackTests(unittest.TestCase):
+    def test_invalid_display_date_has_stable_voice_code(self):
+        app = App.__new__(App)
+        app.batch_date = Mock(get=lambda: '31.02.2026')
+        app.language = 'ru'
+        with self.assertRaises(ValidationError) as raised:
+            App._operation_date(app)
+        self.assertEqual(raised.exception.voice_code, error_codes.INVALID_OPERATION_DATE)
+
+    def test_error_voice_uses_codes_and_maps_storage_failures(self):
+        app = App.__new__(App)
+        app.voice = Mock()
+        error = ValueError('сообщение произвольного текста')
+        error.voice_code = 'cartridge_not_found'
+        App._play_error_voice(app, error)
+        app.voice.play.assert_called_once_with('cartridge_not_found')
+        app.voice.reset_mock()
+        App._play_error_voice(app, sqlite3.OperationalError('disk full'))
+        app.voice.play.assert_called_once_with('data_read_write_failed')
+
     def test_background_resize_does_not_show_startup_save_error(self):
         app = App.__new__(App)
         app.root = Mock()
@@ -63,6 +85,57 @@ class CallbackTests(unittest.TestCase):
         App.remove_dialog(app)
         app.service.remove.assert_called_once_with('0001')
         app.refresh.assert_called_once()
+
+    def _inventory_import_app(self, confirmed):
+        app = App.__new__(App)
+        app.root = Mock()
+        app.language = 'ru'
+        app.t = Mock(side_effect=lambda source, **values: source.format(**values))
+        app.ask_confirmation = Mock(return_value=confirmed)
+        app.service = Mock()
+        app.service.preview_inventory_import.return_value = [{
+            'id': '0001', 'name': 'Модель', 'printers': '',
+            'status': 'Готов', 'operation_date': '2026-11-01'}]
+        app.service.import_inventory.return_value = 1
+        app.refresh = Mock()
+        app.show_dialog = Mock()
+        app._error = Mock()
+        return app
+
+    def test_inventory_import_requires_review_confirmation(self):
+        app = self._inventory_import_app(confirmed=False)
+        with patch('cartridge_app.ui.filedialog.askopenfilename', return_value=r'C:\old\Склад.xlsx'), \
+             patch('cartridge_app.ui.import_inventory_xlsx', return_value=[{'id': '0001'}]):
+            App.import_inventory(app)
+        app.service.preview_inventory_import.assert_called_once()
+        app.service.import_inventory.assert_not_called()
+        app.refresh.assert_not_called()
+
+    def test_inventory_import_commits_after_confirmation_and_refreshes(self):
+        app = self._inventory_import_app(confirmed=True)
+        with patch('cartridge_app.ui.filedialog.askopenfilename', return_value=r'C:\old\Склад.xlsx'), \
+             patch('cartridge_app.ui.import_inventory_xlsx', return_value=[{'id': '0001'}]):
+            App.import_inventory(app)
+        app.service.import_inventory.assert_called_once_with(
+            app.service.preview_inventory_import.return_value, source_name='Склад.xlsx')
+        app.refresh.assert_called_once()
+        app.show_dialog.assert_called_once()
+
+    def test_warehouse_export_uses_full_stock_not_active_filters(self):
+        app = App.__new__(App)
+        app.root = Mock()
+        app.language = 'ru'
+        app.t = Mock(side_effect=lambda source, **values: source.format(**values))
+        app.service = Mock()
+        app.service.list.return_value = [{'id': '0001'}]
+        app.service.profile.return_value = {'organization': 'Org', 'full_name': 'Name'}
+        app.rows = []  # A search/filter can leave the visible table empty.
+        app.show_dialog = Mock()
+        with patch('cartridge_app.ui.filedialog.asksaveasfilename', return_value=r'C:\new\Склад.xlsx'), \
+             patch('cartridge_app.ui.export_inventory') as export:
+            App.export(app)
+        export.assert_called_once_with(app.service.list.return_value, r'C:\new\Склад.xlsx',
+                                      profile=app.service.profile.return_value)
 
     def test_scanned_ids_are_staged_and_one_commit_receives_the_batch(self):
         app = App.__new__(App)
