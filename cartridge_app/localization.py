@@ -6,10 +6,6 @@ import re
 
 EN = {
     'Учёт картриджей': 'Cartridge inventory',
-    'Доступ к приложению': 'Application access',
-    'Введите ключ доступа, чтобы открыть приложение:': 'Enter the access key to open the application:',
-    'Доступ запрещён': 'Access denied',
-    'Неверный ключ доступа. Приложение будет закрыто.': 'The access key is incorrect. The application will close.',
     'Локальный склад • Каждый ID — отдельный физический экземпляр': 'Local inventory • Each ID is a separate physical item',
     '← Главное меню': '← Main menu', 'Профиль': 'Profile', 'Настройки': 'Settings',
     'Все права защищены.': 'All rights reserved.', 'All rights reserved.': 'All rights reserved.',
