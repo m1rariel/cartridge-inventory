@@ -15,7 +15,7 @@ class ValidationError(ValueError):
 STATUSES = ('Готов', 'На заправке', 'Списан', 'Утерян')
 TRANSITIONS = {
     'send': {'Готов': 'На заправке'},
-    'receive': {'На заправке': 'Готов'},
+    'receive': {'На заправке': 'Готов', 'Утерян': 'Готов'},
     'write_off': {'Готов': 'Списан', 'На заправке': 'Списан'},
 }
 ACTION_NAMES = {
@@ -359,10 +359,10 @@ class Service:
 
     @staticmethod
     def _transition_voice_code(action, status):
-        # Special terminal statuses take precedence over the generic action/status message.
+        # Blocked statuses take precedence over the generic action/status message.
         if status == 'Списан' and action in ('send', 'receive'):
             return error_codes.WRITTEN_OFF_ACTION_BLOCKED
-        if status == 'Утерян' and action in ('send', 'receive', 'write_off'):
+        if status == 'Утерян' and action in ('send', 'write_off'):
             return error_codes.LOST_ACTION_BLOCKED
         if action == 'send':
             return error_codes.DISPATCH_NOT_READY

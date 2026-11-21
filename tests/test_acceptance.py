@@ -107,7 +107,7 @@ class AcceptanceTests(unittest.TestCase):
         with self.storage.transaction():
             self.storage.update_cartridge('0002', {'status': 'Утерян'})
         with self.assertRaises(ValidationError) as lost:
-            self.service.preview_transition('0002', 'receive', self.today)
+            self.service.preview_transition('0002', 'send', self.today)
         self.assertEqual(lost.exception.voice_code, error_codes.LOST_ACTION_BLOCKED)
 
     def test_catalog_missing_voice_code(self):
@@ -279,6 +279,96 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(history[0]['operation_date'], self.today)
         self.assertIsNotNone(datetime.fromisoformat(history[0]['recorded_at']).tzinfo)
 
+    def _make_lost(self, ident='lost'):
+        self.service.add(ident, 'Модель', operation_date='2026-10-01')
+        self.service.operate(ident, 'send', '2026-10-01')
+        with self.storage.transaction():
+            self.storage.connection.execute(
+                "UPDATE history SET recorded_at=? WHERE cartridge_id=? AND action='Отправление'",
+                ('2026-10-01T12:00:00+00:00', ident))
+        self.service.mark_overdue_lost(datetime(2026, 10, 8, 12, tzinfo=timezone.utc))
+        return self.service.history(ident)[0]
+
+    def test_lost_receipt_preserves_loss_history_and_records_real_transition(self):
+        loss = self._make_lost()
+        before = self.service.history('lost')
+        self.assertEqual(self.service.preview_receive('lost', '2026-10-08')['status'], 'Утерян')
+        self.assertEqual(self.service.history('lost'), before)
+        result = self.service.operate('lost', 'receive', '2026-10-08')
+        self.assertEqual(result['status'], 'Готов')
+        self.restart()
+        history = self.service.history('lost')
+        self.assertEqual(history[0]['action'], 'Прибытие')
+        self.assertEqual(history[0]['old_status'], 'Утерян')
+        self.assertEqual(history[0]['new_status'], 'Готов')
+        self.assertEqual(history[0]['operation_date'], '2026-10-08')
+        self.assertEqual(history[1], loss)
+        self.assertEqual(len(history), len(before) + 1)
+
+    def test_mixed_receipt_batch_accepts_lost_and_refilling_with_same_date(self):
+        loss = self._make_lost()
+        self.service.add('refilling', 'Модель', operation_date='2026-10-01')
+        self.service.operate('refilling', 'send', '2026-10-01')
+        before = self.service.history()
+        original = self.storage.add_history
+        calls = [0]
+
+        def fail_on_second(record):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise sqlite3.OperationalError('disk full')
+            original(record)
+
+        with patch.object(self.storage, 'add_history', side_effect=fail_on_second):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.service.receive_many(['refilling', 'lost'], '2026-10-09')
+        self.assertEqual(self.service.history(), before)
+        self.assertEqual(self.service.get('refilling')['status'], 'На заправке')
+        self.assertEqual(self.service.get('lost')['status'], 'Утерян')
+        result = self.service.receive_many(['refilling', 'lost'], '2026-10-09')
+        self.assertEqual([item['status'] for item in result], ['Готов', 'Готов'])
+        self.assertEqual([item['operation_date'] for item in result], ['2026-10-09'] * 2)
+        for ident, old_status in (('refilling', 'На заправке'), ('lost', 'Утерян')):
+            entry = self.service.history(ident)[0]
+            self.assertEqual((entry['action'], entry['old_status'], entry['new_status']),
+                             ('Прибытие', old_status, 'Готов'))
+        self.assertEqual(self.service.history('lost')[1], loss)
+
+    def test_lost_receipt_date_validation_and_mixed_batch_are_atomic(self):
+        self._make_lost()
+        self.service.add('refilling', 'Модель', operation_date='2026-10-01')
+        self.service.operate('refilling', 'send', '2026-10-01')
+        before = self.service.history()
+        for operation_date in ('2026-10-07', 'invalid', '2026-02-30'):
+            for method, args in ((self.service.preview_receive, ('lost',)),
+                                 (self.service.operate, ('lost', 'receive')),
+                                 (self.service.receive_many, (['refilling', 'lost'],))):
+                with self.subTest(date=operation_date, method=method.__name__):
+                    with self.assertRaises(ValidationError) as raised:
+                        method(*args, operation_date)
+                    self.assertEqual(raised.exception.voice_code, error_codes.INVALID_OPERATION_DATE)
+                    self.assertEqual(self.service.history(), before)
+                    self.assertEqual(self.service.get('lost')['status'], 'Утерян')
+                    self.assertEqual(self.service.get('refilling')['status'], 'На заправке')
+
+    def test_lost_dispatch_and_write_off_remain_blocked_in_all_paths(self):
+        self._make_lost()
+        self.service.add('ready', 'Модель', operation_date='2026-10-01')
+        before = self.service.history()
+        for action in ('send', 'write_off'):
+            for method, args, kwargs in (
+                    (self.service.preview_transition, ('lost', action, '2026-10-08'), {}),
+                    (self.service.operate, ('lost', action, '2026-10-08'), {'confirmed': True}),
+                    (getattr(self.service, action + '_many'), (['ready', 'lost'], '2026-10-08'),
+                     {'confirmed': True} if action == 'write_off' else {})):
+                with self.subTest(action=action, method=method.__name__):
+                    with self.assertRaises(ValidationError) as raised:
+                        method(*args, **kwargs)
+                    self.assertEqual(raised.exception.voice_code, error_codes.LOST_ACTION_BLOCKED)
+        self.assertEqual(self.service.history(), before)
+        self.assertEqual(self.service.get('ready')['status'], 'Готов')
+        self.assertEqual(self.service.get('lost')['status'], 'Утерян')
+
     def test_receive_batch_is_atomic_and_logs_all_returns(self):
         for ident in ('0001', '0002'):
             self.service.add(ident, 'Одна модель')
@@ -350,7 +440,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(len(self.service.history()), 2)
         with self.storage.transaction():
             self.storage.update_cartridge('1', {'status': 'Утерян'})
-        for action in ('send', 'receive', 'write_off'):
+        for action in ('send', 'write_off'):
             with self.subTest(action=action), self.assertRaises(ValidationError):
                 self.service.operate('1', action, self.today, confirmed=True)
         self.assertEqual(len(self.service.history()), 2)

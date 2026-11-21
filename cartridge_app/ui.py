@@ -566,7 +566,7 @@ class App:
         self.current_screen = 'operation'
         title = {'receive': 'Прибытие', 'send': 'Отправление', 'write_off': 'Списание'}[action]
         details = {
-            'receive': 'Сканируйте ID картриджей, возвращённых из заправки.',
+            'receive': 'Сканируйте ID картриджей со статусом «На заправке» или «Утерян», возвращённых в склад.',
             'send': 'Сканируйте ID картриджей, отправляемых на заправку.',
             'write_off': 'Сканируйте ID картриджей, которые нужно списать.',
         }[action]
@@ -610,7 +610,7 @@ class App:
             try:
                 record = self.service.get(ident)
                 transition = {
-                    'receive': self.t('На заправке → Готов'),
+                    'receive': self.t('{old} → Готов', old=status_label(getattr(self, 'language', 'ru'), record['status'])),
                     'send': self.t('Готов → На заправке'),
                     'write_off': self.t('{old} → Списан', old=status_label(self.language, record['status']))}[action]
                 self.batch_tree.insert('', 'end', values=(record['id'], record['name'], transition))
@@ -641,7 +641,7 @@ class App:
             self._batch_work.setdefault(self.batch_action, []).append(record['id'])
             self._batch_dates[self.batch_action] = self.batch_date.get()
             transition = {
-                'receive': self.t('На заправке → Готов'),
+                'receive': self.t('{old} → Готов', old=status_label(getattr(self, 'language', 'ru'), record['status'])),
                 'send': self.t('Готов → На заправке'),
                 'write_off': self.t('{old} → Списан', old=status_label(getattr(self, 'language', 'ru'), record['status'])),
             }[self.batch_action]
