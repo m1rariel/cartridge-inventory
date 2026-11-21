@@ -137,6 +137,45 @@ class CallbackTests(unittest.TestCase):
         export.assert_called_once_with(app.service.list.return_value, r'C:\new\Склад.xlsx',
                                       profile=app.service.profile.return_value)
 
+    def test_receipt_preview_and_restored_batch_show_actual_status_in_both_languages(self):
+        for language, labels in (('ru', ('На заправке → Готов', 'Утерян → Готов')),
+                                 ('en', ('Refilling → Ready', 'Lost → Ready'))):
+            with self.subTest(language=language):
+                app = App.__new__(App)
+                app.root = Mock()
+                app.body = Mock()
+                app.language = language
+                app.settings = Mock(font_size=12)
+                app._page = Mock()
+                app._table = Mock(return_value=Mock())
+                app.service = Mock()
+                records = [{'id': '0001', 'name': 'Модель', 'status': 'На заправке'},
+                           {'id': '0002', 'name': 'Модель', 'status': 'Утерян'}]
+                app._batch_work = {'receive': ['0001', '0002']}
+                app.service.get.side_effect = records
+                with patch('cartridge_app.ui.tk.StringVar'), \
+                     patch('cartridge_app.ui.ttk.Frame'), \
+                     patch('cartridge_app.ui.ttk.Label'), \
+                     patch('cartridge_app.ui.ttk.Entry'), \
+                     patch('cartridge_app.ui.ttk.Button'), \
+                     patch('cartridge_app.ui.bind_wraplength'):
+                    app.show_operation_batch('receive')
+                self.assertEqual([call.kwargs['values'][2] for call in app.batch_tree.insert.call_args_list],
+                                 list(labels))
+                app.batch_tree.reset_mock()
+                app.batch_ids = []
+                app._batch_work = {}
+                app.batch_scan = Mock(get=Mock(side_effect=['0001', '0002']))
+                app.batch_date = Mock(get=lambda: '2026-10-29')
+                app.service.preview_transition.side_effect = records
+                with patch('cartridge_app.ui.transition_label'):
+                    app._scan_incoming()
+                    app._scan_incoming()
+                self.assertEqual(app.batch_ids, ['0001', '0002'])
+                self.assertEqual([call.kwargs['values'][2] for call in app.batch_tree.insert.call_args_list],
+                                 list(labels))
+                app.service.receive_many.assert_not_called()
+
     def test_scanned_ids_are_staged_and_one_commit_receives_the_batch(self):
         app = App.__new__(App)
         app.root = Mock()
